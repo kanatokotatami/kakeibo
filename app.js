@@ -12,6 +12,9 @@ const DEFAULT_CATEGORIES = ['食費', '日用品', '交通費', '外食', '趣�
 const PALETTE = ['#2f7d5b', '#e07a3f', '#3f7fc4', '#c9a227', '#9b59b6', '#d4526e', '#17a2a2',
   '#7a8b2e', '#8c6d4f', '#5c6bc0', '#e57fb0', '#4caf50', '#ff9f40', '#7f8c8d'];
 const METHOD_COLORS = { '現金': '#2f7d5b', 'クレカ': '#e07a3f', 'その他': '#3f7fc4' };
+const PARSER_VERSION = 2;
+const OLD_QUERIES = ['(Olive OR from:vpass.ne.jp OR from:smbc.co.jp) ご利用'];
+const DEFAULT_QUERY = 'from:(statement@vpass.ne.jp OR smbc.co.jp) ご利用日時';
 
 /* ---------- 状態 ---------- */
 let state = load();
@@ -24,9 +27,12 @@ function defaultState() {
     entries: [],   // {id,date,amount,category,method,memo,source:'manual'|'olive',gmailId?}
     incomes: [],   // {id,date,amount,source,memo}
     categories: DEFAULT_CATEGORIES.slice(),
+    parserVersion: PARSER_VERSION,
+    mailLog: {},        // gmailId -> {ym, status:'skipped'|'cancel'|'netted'|'deleted'}
+    pendingCancels: [], // 対応する購入がまだ見つからない取消 {gmailId,ym,dt,shop,amount}
     settings: {
       clientId: '',
-      query: '(Olive OR from:vpass.ne.jp OR from:smbc.co.jp) ご利用',
+      query: DEFAULT_QUERY,
       oliveCategory: 'その他',
       autoSync: false,
     },
@@ -36,10 +42,21 @@ function load() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return defaultState();
-    const s = JSON.parse(raw);
-    const d = defaultState();
-    return { ...d, ...s, settings: { ...d.settings, ...(s.settings || {}) } };
+    return migrate(JSON.parse(raw));
   } catch (e) { return defaultState(); }
+}
+function migrate(s) {
+  const d = defaultState();
+  const st = { ...d, ...s, settings: { ...d.settings, ...(s.settings || {}) } };
+  if ((s.parserVersion || 1) < PARSER_VERSION) {
+    // 旧バージョンで「読み取れない」と判定されたメールを再解析できるようにリセット
+    delete st.ignoredGmailIds;
+    st.mailLog = {}; st.pendingCancels = [];
+    if (OLD_QUERIES.includes(st.settings.query)) st.settings.query = DEFAULT_QUERY;
+    st.parserVersion = PARSER_VERSION;
+  }
+  st.mailLog ||= {}; st.pendingCancels ||= [];
+  return st;
 }
 function save() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
@@ -260,7 +277,7 @@ function setupForms() {
     } else if (action === 'delete') {
       const en = state.entries.find(x => x.id === id);
       // Olive 取り込み分は削除しても再同期で復活しないよう記録
-      if (en?.gmailId) (state.ignoredGmailIds ||= []).push(en.gmailId);
+      if (en?.gmailId) state.mailLog[en.gmailId] = { ym: en.date.slice(0, 7), status: 'deleted' };
       state.entries = state.entries.filter(x => x.id !== id); save(); renderAll(); toast('削除しました');
     }
   });
@@ -336,8 +353,7 @@ function setupSettings() {
       const s = JSON.parse(await f.text());
       if (!Array.isArray(s.entries) || !Array.isArray(s.incomes)) throw new Error('形式が違います');
       if (!confirm('現在のデータをバックアップの内容で置き換えますか？')) return;
-      const d = defaultState();
-      state = { ...d, ...s, settings: { ...d.settings, ...(s.settings || {}) } };
+      state = migrate(s);
       save(); setupSettings(); renderAll(); toast('復元しました');
     } catch (err) { toast('復元に失敗しました: ' + err.message); }
     e.target.value = '';
@@ -413,50 +429,125 @@ function extractText(payload) {
   return doc.body?.textContent || '';
 }
 
+/* ---------- Olive メール解析 ---------- */
+// 全角英数記号→半角、各種マイナス記号を統一
+function normalize(s) {
+  return s.replace(/\r/g, '')
+    .replace(/[！-～]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/[−‒–—－]/g, '-')
+    .replace(/　| /g, ' ')
+    .replace(/￥/g, '¥');
+}
+
+// 店名から使用用途を推測（該当なしなら設定の既定用途）
+const CATEGORY_RULES = [
+  ['外食', ['マクドナルド', 'すき家', '吉野家', '松屋', 'なか卯', 'スターバックス', 'STARBUCKS', 'ドトール', 'タリーズ', 'コメダ',
+    'ガスト', 'サイゼリヤ', 'ケンタッキー', 'モスバーガー', 'バーガーキング', 'ロッテリア', 'ミスタードーナツ', 'くら寿司', 'スシロー',
+    'はま寿司', '丸亀製麺', 'ココイチ', 'COCO壱', '日高屋', '王将', 'デニーズ', 'ジョナサン', 'UBER EATS', '出前館', 'WOLT']],
+  ['食費', ['セブン-イレブン', 'セブンイレブン', 'ファミリーマート', 'ローソン', 'ミニストップ', 'デイリーヤマザキ', 'イオン', '西友',
+    'ライフ', 'イトーヨーカドー', 'マルエツ', 'まいばすけっと', '業務スーパー', 'OKストア', '成城石井', 'サミット', 'ヤオコー', 'コープ']],
+  ['交通費', ['JR', 'SUICA', 'スイカ', 'PASMO', 'ICOCA', 'タクシー', 'メトロ', '鉄道', 'ENEOS', '出光', 'コスモ石油', 'タイムズ']],
+  ['日用品', ['マツモトキヨシ', 'マツキヨ', 'ウエルシア', 'スギ薬局', 'ツルハ', 'サンドラッグ', 'ココカラファイン', 'ダイソー', 'セリア',
+    'キャンドゥ', 'ニトリ', '無印良品', 'ドン・キホーテ', 'ドンキ', 'カインズ']],
+  ['通信費', ['ドコモ', 'DOCOMO', 'AU ', 'ソフトバンク', 'SOFTBANK', '楽天モバイル', 'AHAMO', 'POVO', 'LINEMO', 'UQ']],
+  ['サブスク', ['NETFLIX', 'SPOTIFY', 'AMAZON PRIME', 'APPLE.COM', 'GOOGLE PLAY', 'YOUTUBE', 'DISNEY', 'U-NEXT', 'HULU', 'DAZN']],
+  ['衣服・美容', ['ユニクロ', 'UNIQLO', 'GU ', 'ZARA', 'H&M', 'しまむら']],
+];
+function guessCategory(shop) {
+  const s = normalize(shop).toUpperCase() + ' ';
+  for (const [cat, words] of CATEGORY_RULES) {
+    if (state.categories.includes(cat) && words.some(w => s.includes(w.toUpperCase()))) return cat;
+  }
+  return state.settings.oliveCategory;
+}
+
 /**
- * Olive（三井住友カード / 三井住友銀行）のご利用通知メールを解析。
- * 代表的な書式: 「ご利用日時：2026/11/03 12:34」「ご利用先：○○」「ご利用金額：1,234円」
- * 書式が変わっても拾えるよう、ラベル付き → ラベル無しの順でゆるく探索します。
+ * Olive（三井住友カード）ご利用通知メールを解析し、取引の配列を返す。
+ * 実際の書式:
+ *   Ｏｌｉｖｅ／クレジットについてカードの利用内容をお知らせします。
+ *   ご利用日時：2026/11/23 15:42
+ *   ファミリーマート（買物）	638円
+ *   マクドナルド（取消）	-970円   ← 取消
+ * 決済通知ではないメールは空配列。
  */
-function parseOliveMail(text, subject, headerDate) {
-  const t = text.replace(/\r/g, '').replace(/[：]/g, ':').replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
-    .replace(/[，]/g, ',').replace(/￥|¥/g, '¥');
+function parseOliveMail(rawText, subject = '', headerDate = '') {
+  const t = normalize(rawText);
+  const all = normalize(subject) + '\n' + t;
 
-  // 金額
-  let amount = null;
-  const amtLabeled = /(?:ご利用金額|利用金額|お支払(?:い)?金額|お引落(?:し)?金額|ご請求金額|金額)\s*[:\s]\s*¥?\s*([\d,]+)\s*円?/.exec(t);
-  const amtAny = /¥\s*([\d,]+)|([\d,]+)\s*円/.exec(t);
-  if (amtLabeled) amount = +amtLabeled[1].replace(/,/g, '');
-  else if (amtAny) amount = +(amtAny[1] || amtAny[2]).replace(/,/g, '');
-  if (!amount || amount <= 0) return null;
+  // 支払い種別（「Olive/クレジット」「Olive/デビット」等の表記を優先）
+  const kindM = /Olive\s*\/\s*(クレジット|デビット|ポイント払い|プリペイド)/.exec(all);
+  const kind = kindM ? kindM[1] : /デビット/.test(all) ? 'デビット' : 'クレジット';
+  const method = kind === 'クレジット' ? 'クレカ' : 'その他';
 
-  // 日付
-  let date = null;
-  const dLabeled = /(?:ご利用日時|ご利用日|利用日|お取引日|取引日時?)\s*[:\s]\s*(\d{4})[\/年.-](\d{1,2})[\/月.-](\d{1,2})/.exec(t);
-  const dAny = /(\d{4})[\/年.-](\d{1,2})[\/月.-](\d{1,2})/.exec(t);
-  const dm = dLabeled || dAny;
-  if (dm) date = `${dm[1]}-${pad(+dm[2])}-${pad(+dm[3])}`;
-  else { const hd = new Date(headerDate); if (!isNaN(hd)) date = `${hd.getFullYear()}-${pad(hd.getMonth() + 1)}-${pad(hd.getDate())}`; }
-  if (!date) return null;
+  const txs = [];
+  const mk = (y, mo, d, hh, mm, shopRaw, amtStr) => {
+    let amount = +amtStr.replace(/[,\s]/g, '');
+    if (!amount) return;
+    let shop = shopRaw.trim().replace(/^[:\s]+/, '');
+    const typeM = /[（(]([^（）()]{1,8})[）)]\s*$/.exec(shop);
+    const type = typeM ? typeM[1] : '';
+    if (typeM) shop = shop.slice(0, typeM.index).trim();
+    const cancel = amount < 0 || /取消|取り消し|返品|キャンセル/.test(type);
+    const date = `${y}-${pad(+mo)}-${pad(+d)}`;
+    txs.push({ date, dt: `${date} ${hh ? pad(+hh) + ':' + mm : '00:00'}`, shop: shop.slice(0, 60),
+      amount: Math.abs(amount), cancel, type, method, kind });
+  };
 
-  // 利用先
-  const shop = /(?:ご利用先|利用先|ご利用店名|加盟店名|お支払先|ご利用内容)\s*[:\s]\s*([^\n]+)/.exec(t)?.[1]?.trim() || '';
+  // 書式A：「ご利用日時：日付」の次行に「店名（種別）<TAB>金額円」（1通に複数あっても対応）
+  const reA = /ご利用日時\s*:?\s*(\d{4})\/(\d{1,2})\/(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?[^\n]*\n\s*([^\n]+?)\s*(-?\s*[\d,]+)\s*円/g;
+  for (const m of t.matchAll(reA)) mk(m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+  if (txs.length) return txs;
 
-  // 決済方法：デビット・ポイント払いは「その他」、それ以外（クレジット）は「クレカ」
-  const all = subject + '\n' + t;
-  const method = /デビット|debit|ポイント払い/i.test(all) ? 'その他' : 'クレカ';
-  const kind = /デビット/i.test(all) ? 'デビット' : /ポイント払い/.test(all) ? 'ポイント払い' : 'クレジット';
+  // 書式B：ラベル付き（「ご利用日：」「ご利用先：」「ご利用金額：」）
+  const dM = /(?:ご利用日時?|利用日|お取引日時?|取引日時?)\s*:?\s*(\d{4})[\/年.-](\d{1,2})[\/月.-](\d{1,2})日?(?:\s+(\d{1,2}):(\d{2}))?/.exec(t);
+  const aM = /(?:ご利用金額|利用金額|お支払(?:い)?金額|お取引金額|ご利用額)\s*:?\s*¥?\s*(-?[\d,]+)\s*円?/.exec(t);
+  if (dM && aM) {
+    const shop = /(?:ご利用先|利用先|ご利用店名?|加盟店名?|お支払先)\s*:?\s*([^\n]+)/.exec(t)?.[1] || '';
+    mk(dM[1], dM[2], dM[3], dM[4], dM[5], shop, aM[1]);
+  }
+  return txs;
+}
 
-  return { amount, date, shop: shop.slice(0, 60), method, kind };
+/* ---------- Gmail 同期 ---------- */
+const dtDiffDays = (a, b) => (new Date(a.replace(' ', 'T')) - new Date(b.replace(' ', 'T'))) / 86400000;
+
+// 取消を、同じ店・同じ金額で直前（7日以内）の購入と相殺する
+function applyCancels(cancels, ym) {
+  let netted = 0; const remain = [];
+  for (const c of cancels.sort((a, b) => a.dt.localeCompare(b.dt))) {
+    let best = null;
+    for (const e of state.entries) {
+      if (e.source !== 'olive' || e.amount !== c.amount || (e.shop || '') !== c.shop || !e.dt) continue;
+      const diff = dtDiffDays(c.dt, e.dt);
+      if (diff < 0 || diff > 7) continue;
+      if (!best || e.dt > best.dt) best = e;
+    }
+    if (best) {
+      state.entries = state.entries.filter(e => e !== best);
+      state.mailLog[best.gmailId] = { ym: best.date.slice(0, 7), status: 'netted' };
+      state.mailLog[c.gmailId] = { ym: c.ym, status: 'cancel' };
+      netted++;
+    } else remain.push(c);
+  }
+  return { netted, remain };
+}
+
+function resetOliveMonth(y, m) {
+  const ym = ymKey(y, m);
+  state.entries = state.entries.filter(e => !(e.source === 'olive' && e.date.startsWith(ym)));
+  for (const [id, v] of Object.entries(state.mailLog)) if (v.ym === ym) delete state.mailLog[id];
+  state.pendingCancels = state.pendingCancels.filter(c => c.ym !== ym);
+  save(); renderAll();
 }
 
 async function syncOlive({ interactive = true, y = cur.y, m = cur.m } = {}) {
   const st = $('syncStatus'); const btn = $('syncBtn');
-  btn.disabled = true; st.textContent = 'Google に接続中…';
+  btn.disabled = true; $('resyncBtn').disabled = true; st.textContent = 'Google に接続中…';
   try {
     let token = getToken();
     if (!token) token = await requestToken(interactive);
 
+    const ym = ymKey(y, m);
     const next = new Date(y, m, 1);
     const q = `${state.settings.query} after:${y}/${pad(m)}/01 before:${next.getFullYear()}/${pad(next.getMonth() + 1)}/01`;
     st.textContent = 'メールを検索中…';
@@ -464,36 +555,51 @@ async function syncOlive({ interactive = true, y = cur.y, m = cur.m } = {}) {
     do {
       const r = await gmail(`messages?maxResults=100&q=${encodeURIComponent(q)}${pageToken ? '&pageToken=' + pageToken : ''}`, token);
       ids.push(...(r.messages || []).map(x => x.id)); pageToken = r.nextPageToken || '';
-    } while (pageToken && ids.length < 1000);
+    } while (pageToken && ids.length < 2000);
 
-    const known = new Set([...state.entries.filter(e => e.gmailId).map(e => e.gmailId), ...(state.ignoredGmailIds || [])]);
+    const known = new Set([...state.entries.filter(e => e.gmailId).map(e => e.gmailId), ...Object.keys(state.mailLog),
+      ...state.pendingCancels.map(c => c.gmailId)]);
     const todo = ids.filter(id => !known.has(id));
-    let added = 0, skipped = 0;
+    let added = 0, notPayment = 0;
+    const cancels = [];
     for (let i = 0; i < todo.length; i++) {
       st.textContent = `メールを解析中… ${i + 1}/${todo.length}`;
       const msg = await gmail(`messages/${todo[i]}?format=full`, token);
       const hs = msg.payload?.headers || [];
       const subject = hs.find(h => h.name.toLowerCase() === 'subject')?.value || '';
-      const hdate = hs.find(h => h.name.toLowerCase() === 'date')?.value || +msg.internalDate;
-      const p = parseOliveMail(extractText(msg.payload), subject, hdate);
-      if (!p) { skipped++; (state.ignoredGmailIds ||= []).push(todo[i]); continue; }
-      state.entries.push({ id: uid(), date: p.date, amount: p.amount, category: state.settings.oliveCategory,
-        method: p.method, memo: p.shop || `Olive ${p.kind}`, source: 'olive', gmailId: todo[i] });
-      added++;
+      const txs = parseOliveMail(extractText(msg.payload), subject);
+      if (!txs.length) { notPayment++; state.mailLog[todo[i]] = { ym, status: 'skipped' }; continue; }
+      for (const tx of txs) {
+        if (tx.cancel) { cancels.push({ gmailId: todo[i], ym, dt: tx.dt, shop: tx.shop, amount: tx.amount }); continue; }
+        state.entries.push({ id: uid(), date: tx.date, dt: tx.dt, amount: tx.amount, category: guessCategory(tx.shop),
+          method: tx.method, shop: tx.shop, memo: tx.shop || `Olive ${tx.kind}`, source: 'olive', gmailId: todo[i] });
+        added++;
+      }
     }
+    // 今回の取消 ＋ 以前から保留中の取消をまとめて相殺
+    const { netted, remain } = applyCancels([...state.pendingCancels, ...cancels], ym);
+    state.pendingCancels = remain;
     save(); renderAll();
-    st.textContent = `完了：${ids.length}件のメールを確認、${added}件を追加` +
-      (ids.length - todo.length ? `（${ids.length - todo.length}件は取り込み済み）` : '') +
-      (skipped ? `\n${skipped}件は金額を読み取れなかったため除外しました` : '');
-    if (added) toast(`Olive の決済を${added}件取り込みました`);
+
+    const lines = [`完了：${ids.length}件のメールを確認し、${added}件の決済を追加しました`];
+    if (ids.length - todo.length) lines.push(`・${ids.length - todo.length}件は取り込み済み`);
+    if (netted) lines.push(`・取消 ${netted}件を元の決済と相殺しました`);
+    if (remain.length) lines.push(`・元の決済が見つからない取消が${remain.length}件あります（見つかり次第相殺します）`);
+    if (notPayment) lines.push(`・${notPayment}件は決済通知ではないため対象外です`);
+    st.textContent = lines.join('\n');
+    if (added || netted) toast(`Olive：${added}件追加${netted ? `・${netted}件相殺` : ''}`);
   } catch (err) {
     st.textContent = '同期できませんでした：' + err.message;
-  } finally { btn.disabled = false; }
+  } finally { btn.disabled = false; $('resyncBtn').disabled = false; }
 }
 
 /* ---------- 起動 ---------- */
 setupNav(); setupForms(); setupSettings(); renderAll();
 $('syncBtn').onclick = () => syncOlive({ interactive: true });
+$('resyncBtn').onclick = () => {
+  if (!confirm(`${cur.y}年${cur.m}月の Olive 取り込み分を削除して、もう一度取り込みますか？\n（手入力のデータは消えません）`)) return;
+  resetOliveMonth(cur.y, cur.m); syncOlive({ interactive: true });
+};
 window.addEventListener('load', () => {
   if (state.settings.autoSync && state.settings.clientId) {
     const now = new Date();
@@ -505,4 +611,4 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', (
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 
 // テスト用に公開
-window.__kakeibo = { parseOliveMail, get state() { return state; } };
+window.__kakeibo = { parseOliveMail, guessCategory, get state() { return state; } };

@@ -136,8 +136,9 @@ dialog::backdrop{background:rgba(0,0,0,.4)}
 
   <div class="card">
     <h2>Olive（Gmail）から取り込み</h2>
-    <p class="note">表示中の月の Olive 決済メールを Gmail から読み込み、1日ごとの明細として自動でまとめます。取り込み済みのメールは重複登録されません。</p>
+    <p class="note">表示中の月の Olive 決済メールを Gmail から読み込み、1日ごとの明細として自動でまとめます。取り込み済みのメールは重複登録されず、取消メールは元の決済と相殺されます。店名から使用用途を自動で振り分けます。</p>
     <button class="btn sub" id="syncBtn">この月の Olive 決済を同期</button>
+    <button class="btn sub" id="resyncBtn" style="background:transparent;border:1px solid var(--line);color:var(--sub);font-weight:400">この月の取り込みをやり直す</button>
     <div class="status" id="syncStatus"></div>
   </div>
 </section>
